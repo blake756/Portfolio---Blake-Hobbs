@@ -1,0 +1,185 @@
+import os   #This module interacts with local operating system
+import time #Gets current time and date
+import requests #makes http requests that interact with online resources
+import pandas as pd 
+import yfinance as yf #This project grabs stock information from yahoo finance
+from datetime import datetime, timedelta, timezone 
+from dotenv import load_dotenv #Keeps API keys out of the source code
+
+load_dotenv()  #loads the virtual environment where the API keys are stored
+
+NEWS_API_KEY = "e4ad14b48a4c437294873ac3cde90374" #saves the NewsAPI key to a variable
+
+#creates list of companies
+COMPANIES = [
+    "Amazon",
+    "Walmart",
+    "Target",
+    "Costco",
+    "Nike",
+    "Tesla",
+    "Microsoft",
+    "Meta",
+]
+
+# Map companies to tickers in a dictionary (used by yfinance)
+COMPANY_TICKERS = {
+    "Amazon": "AMZN",
+    "Walmart": "WMT",
+    "Target": "TGT",
+    "Costco": "COST",
+    "Nike": "NKE",
+    "Tesla": "TSLA",
+    "Microsoft": "MSFT",
+    "Meta": "META",  
+}
+
+NEWS_LOOKBACK_DAYS = 7 #sets the window for the number of days we are grabbing newd headlines for these companies from
+
+def fetch_news(company_name: str, api_key: str = NEWS_API_KEY) -> pd.DataFrame: #defines a function that accepts a comapny and the newsapi key variable
+    if not api_key: #if the API key doesn't work, show a message explaining that
+        raise ValueError("NEWS_API_KEY is not set.")
+    from_date = (datetime.now(timezone.utc) - timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")   #uses the datetime and timedelta to set the lookback window
+    params = {  #uses the paramaters specified by the NewsAPI module to gather articles pertaining to the companies in the dicitionary above
+        "q": company_name,
+        "from": from_date,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "pageSize": 100,
+        "apiKey": api_key,
+    }
+    resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)  #sends a GET request to the API and fetches the articles with the parameters meantioned earlier
+    resp.raise_for_status() #This tells you there error code if something were to go wrong 
+    data = resp.json() #saves the data to a json file
+    articles = data.get("articles", []) #this grabs the list of articles from the previous json file and saves it to a variable. If that doesn't work it returns an empty list
+    if not articles: #if there are no articles, then the code will display this message
+        print(f"  [NewsAPI] No articles found for '{company_name}'") 
+        return pd.DataFrame() #returns a Pandas dataframe
+    rows = [] #sets rows to an empty list
+    for idx, art in enumerate(articles): #grabs the index AND the article and loops through them, using the enumerate function
+        pub_ts = pd.to_datetime(art.get("publishedAt")) #takes the publishedAt data point from each index and turns it into a datetime object
+        # normalize to UTC and store date string for joining
+        pub_ts = pub_ts.tz_convert("UTC") if pub_ts.tzinfo is not None else pub_ts.tz_localize("UTC")  #if the datetime works and doesnt' return nothing, this line converts the time to UTC or assigns it the UTC timezone if there is no time associated with the article 
+        rows.append({  
+            "article_id": f"{company_name.lower()}_{from_date}_{idx:04d}", #changes the company name to lowercase and combines it with the from date. Then it formats the idx number to 4 digits
+            "company": company_name, #sets the company as equal to the company_name
+            "title": (art.get("title") or "").strip(), #tries to find "title" in the dicitonary art and defaults to an empty string if that doens't work. Then it strips the string of any spaces
+            "description": (art.get("description") or "").strip(), #same thing but this time it grabs "description" from the dictionary
+            "source": art.get("source", {}).get("name", ""), #grabs source or returns empty dictionary, then grabs name or returns an empty string
+            "published_at": pub_ts, #puts the time we created into the rows
+            "published_date": pub_ts.date().isoformat(), #turns the UTC time we made using tz_convert and turns it into a date. then it formats it into isoformat ("YYYY-MM-DD")
+            "url": art.get("url", ""), #gets url from art dictionary or returns empty string 
+        })
+    df = pd.DataFrame(rows) #turns the rows created above into a proper dataframe. 
+    before = len(df) #stores the length of the dataframe into a variable
+    df = df.drop_duplicates(subset=["title", "source"]).reset_index(drop=True) #examines the df, searching for duplicates where the title and the source specifically are the same
+    dupes_dropped = before - len(df) #takes the before variable established and counts the number of duplicates dropped
+    if dupes_dropped: #if any duplicates are dropped, the code will show a message explaining how many were dropped and what company they are associated with
+        print(f"  [NewsAPI] Dropped {dupes_dropped} duplicate(s) for '{company_name}'")
+    return df  #it will then return the dataframe
+
+
+def fetch_all_news(companies: list = COMPANIES) -> pd.DataFrame: 
+    frames = []
+    for company in companies:
+        print(f"  Fetching news: {company} ...")
+        try:
+            df = fetch_news(company)
+            if not df.empty:
+                frames.append(df)
+        except requests.exceptions.HTTPError as e:
+            print(f"  [ERROR] HTTP error for '{company}': {e}")
+        except Exception as e:
+            print(f"  [ERROR] Unexpected error for '{company}': {e}")
+    if not frames:
+        print("No news data returned for any company.")
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True).sort_values("published_at", ascending=False).reset_index(drop=True)
+    return combined
+
+
+def fetch_stock_prices_yf(ticker: str, lookback_days: int = NEWS_LOOKBACK_DAYS) -> pd.DataFrame:
+    end = pd.Timestamp.utcnow().date()
+    start = end - pd.Timedelta(days=lookback_days + 7)  # extra buffer to ensure previous trading days included
+    data = yf.download(ticker, start=str(start), end=str(end + pd.Timedelta(days=1)), progress=False)
+    if data.empty:
+        print(f"  [yfinance] No data for {ticker}")
+        return pd.DataFrame()
+    df = data.reset_index()
+    df["date"] = df["Date"].dt.date.astype(str)
+    df = df.rename(columns={
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adjusted_close",
+        "Volume": "volume"
+    })
+    df = df[["date", "open", "high", "low", "close", "adjusted_close", "volume"]]
+    df["symbol"] = ticker
+    return df.sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def fetch_all_stocks(company_tickers: dict = COMPANY_TICKERS) -> pd.DataFrame:
+    frames = []
+    for company, ticker in company_tickers.items():
+        print(f"  Fetching stock prices: {company} ({ticker}) ...")
+        try:
+            df = fetch_stock_prices_yf(ticker)
+            if not df.empty:
+                df["company"] = company
+                frames.append(df)
+        except Exception as e:
+            print(f"  [ERROR] Unexpected error for '{ticker}': {e}")
+        # small sleep to be polite to remote servers
+        time.sleep(0.5)
+    if not frames:
+        print("No stock data returned for any ticker.")
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True).sort_values(["company", "date"], ascending=[True, False]).reset_index(drop=True)
+    return combined
+
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("NEWS + STOCK INGESTION PIPELINE")
+    print(f"Companies tracked : {len(COMPANIES)}")
+    print(f"Lookback window   : {NEWS_LOOKBACK_DAYS} days")
+    print(f"Run time          : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 55)
+
+    news_df = fetch_all_news()
+
+    if news_df.empty:
+        print("\n✗ No news articles collected. Check your NewsAPI key and network.")
+    else:
+        print(f"\n✓ Total news articles collected : {len(news_df)}")
+        print(f"  Date range : {news_df['published_date'].min()} → {news_df['published_date'].max()}")
+        print("\nArticles per company:")
+        print(news_df["company"].value_counts().to_string())
+        print("\nSample (5 most recent):")
+        print(news_df[["company", "title", "source", "published_at"]].head(5).to_string(index=False))
+
+    stock_df = fetch_all_stocks()
+
+    if stock_df.empty:
+        print("\n✗ No stock prices collected. Check network or yfinance.")
+    else:
+        print(f"\n✓ Total stock rows collected : {len(stock_df)}")
+        print("\nSample (latest 5 rows):")
+        print(stock_df[["company", "symbol", "date", "adjusted_close"]].head(5).to_string(index=False))
+
+    if (not news_df.empty) and (not stock_df.empty):
+        merged = pd.merge(
+            news_df,
+            stock_df,
+            left_on=["company", "published_date"],
+            right_on=["company", "date"],
+            how="left",
+            suffixes=("_news", "_stock")
+        )
+        print(f"\nMerged rows (news joined with same-day stock data): {len(merged)}")
+        print("\nSample merged rows (5):")
+        print(merged[["company", "published_date", "title", "symbol", "adjusted_close"]].head(5).to_string(index=False))
+
+    print("\nDone.")
